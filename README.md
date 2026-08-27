@@ -47,3 +47,41 @@ firebase deploy
 
 Copy `.firebaserc.example` to `.firebaserc` and set your Firebase project id first.
 
+## GitHub Actions deployment
+
+Pushes to `main` deploy the backend automatically via:
+
+```txt
+.github/workflows/deploy_backend.yml
+```
+
+Pull requests and pushes to `main` also run:
+
+```txt
+.github/workflows/backend_ci.yml
+```
+
+Add this GitHub secret:
+
+```txt
+FIREBASE_SERVICE_ACCOUNT_SPITTY_BACKEND
+```
+
+Its value should be the raw JSON for a Google Cloud service account that can
+deploy Firebase Functions, Firestore rules, and Storage rules for project
+`spitty-backend`.
+
+Minimum practical roles:
+
+- Firebase Admin
+- Cloud Functions Admin
+- Cloud Run Admin
+- Cloud Build Editor
+- Service Account User
+- Artifact Registry Admin
+- Eventarc Admin
+- Pub/Sub Admin
+- Firebase Rules Admin
+- Storage Admin
+
+You can tighten these later, but this gets CI deployment unblocked.

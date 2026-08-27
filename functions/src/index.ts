@@ -20,7 +20,7 @@ type TrainingExamplePayload = {
   storagePath: string;
   bpm: number;
   bars: number;
-  quantization: "1/4" | "1/8" | "1/16";
+  quantization: "1/2" | "1/4" | "1/8" | "1/16";
   events: GridEvent[];
   appVersion?: string;
   localModelVersion?: string;
@@ -58,7 +58,7 @@ function assertTrainingPayload(data: unknown): TrainingExamplePayload {
   if (typeof payload.bars !== "number" || payload.bars < 1 || payload.bars > 32) {
     throw new HttpsError("invalid-argument", "bars must be between 1 and 32.");
   }
-  if (!["1/4", "1/8", "1/16"].includes(payload.quantization ?? "")) {
+  if (!["1/2", "1/4", "1/8", "1/16"].includes(payload.quantization ?? "")) {
     throw new HttpsError("invalid-argument", "Invalid quantization.");
   }
   if (!Array.isArray(payload.events)) {
@@ -125,4 +125,3 @@ export const getActiveModelManifest = onRequest(async (_request, response) => {
   response.set("Cache-Control", "public, max-age=300");
   response.json(snapshot.data());
 });
-
