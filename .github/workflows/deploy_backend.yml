@@ -35,13 +35,25 @@ jobs:
       - name: Install Firebase CLI
         run: npm install -g firebase-tools
 
-      - name: Deploy backend targets
+      - name: Prepare Firebase service account
         env:
           FIREBASE_SERVICE_ACCOUNT_JSON: "${{ secrets.FIREBASE_SERVICE_ACCOUNT_SPITTY_BACKEND }}"
         run: |
+          if [ -z "$FIREBASE_SERVICE_ACCOUNT_JSON" ]; then
+            echo "Missing GitHub secret: FIREBASE_SERVICE_ACCOUNT_SPITTY_BACKEND"
+            echo "Add it to the spitty_backend repository secrets as the raw Google service-account JSON."
+            exit 1
+          fi
           printf '%s' "$FIREBASE_SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/firebase-service-account.json"
-          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/firebase-service-account.json"
+          node -e "const fs = require('fs'); const json = JSON.parse(fs.readFileSync(process.argv[1], 'utf8')); if (!json.client_email || !json.private_key) throw new Error('Service account JSON must include client_email and private_key'); console.log('Using Firebase service account:', json.client_email);" "$RUNNER_TEMP/firebase-service-account.json"
+
+      - name: Deploy backend targets
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/firebase-service-account.json
+        run: |
+          firebase --version
           firebase deploy \
             --project spitty-backend \
             --only functions,firestore:rules,storage \
-            --force
+            --force \
+            --non-interactive
