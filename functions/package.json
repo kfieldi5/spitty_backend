@@ -9,7 +9,11 @@
     "build": "tsc",
     "serve": "npm run build && firebase emulators:start --only functions,firestore,storage",
     "deploy": "firebase deploy --only functions,firestore:rules,storage",
-    "lint": "eslint --ext .ts src"
+    "lint": "eslint --ext .ts src",
+    "model:check": "node --check scripts/publish-model.mjs",
+    "model:publish": "node scripts/publish-model.mjs",
+    "model:threshold": "node scripts/set-training-threshold.mjs",
+    "training:queued": "node scripts/has-queued-training.mjs"
   },
   "dependencies": {
     "firebase-admin": "^13.6.0",

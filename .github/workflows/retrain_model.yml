@@ -1,0 +1,79 @@
+name: Retrain remote model
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: spitty-remote-model-training
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  train:
+    name: Train queued correction batch
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: functions/package-lock.json
+
+      - name: Install queue-check dependencies
+        working-directory: functions
+        run: npm ci
+
+      - name: Prepare Firebase service account
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: "${{ secrets.FIREBASE_SERVICE_ACCOUNT_SPITTY_BACKEND }}"
+        run: |
+          if [ -z "$FIREBASE_SERVICE_ACCOUNT_JSON" ]; then
+            echo "Missing FIREBASE_SERVICE_ACCOUNT_SPITTY_BACKEND."
+            exit 1
+          fi
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/firebase-service-account.json"
+
+      - name: Check for queued training
+        id: queue
+        working-directory: functions
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/firebase-service-account.json
+        run: npm run training:queued
+
+      - name: Set up Python
+        if: steps.queue.outputs.queued == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: trainer/requirements.txt
+
+      - name: Install model-training dependencies
+        if: steps.queue.outputs.queued == 'true'
+        run: |
+          python -m pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.12.1
+          python -m pip install --requirement trainer/requirements.txt
+
+      - name: Train, validate, and publish
+        if: steps.queue.outputs.queued == 'true'
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/firebase-service-account.json
+        run: |
+          python trainer/retrain.py \
+            --project spitty-backend \
+            --bucket spitty-backend.firebasestorage.app
+
+      - name: No queued correction batch
+        if: steps.queue.outputs.queued != 'true'
+        run: echo "No model-training job is queued."

@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   deploy:
-    name: Deploy Functions, Firestore rules, and Storage rules
+    name: Deploy Firebase backend and Hosting
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -54,6 +54,6 @@ jobs:
           firebase --version
           firebase deploy \
             --project spitty-backend \
-            --only functions,firestore:rules,storage \
+            --only functions,firestore:rules,storage,hosting \
             --force \
             --non-interactive
