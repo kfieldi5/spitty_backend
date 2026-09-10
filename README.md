@@ -10,11 +10,11 @@ in the Firebase console.
 The intended flow:
 
 1. The app records FTUE calibration audio or a custom beatbox recording.
-2. The user verifies/corrects the generated grid.
+2. The user confirms a perfect result or corrects the generated grid.
 3. The app uploads the original audio to Firebase Storage.
 4. The app calls `submitTrainingExample` with the Storage path plus verified labels/grid metadata.
 5. Cloud Functions writes a training manifest document into Firestore.
-6. Every configurable batch of eligible corrections queues a training job.
+6. Every configurable batch of eligible verified beats queues a training job.
 7. GitHub Actions fine-tunes the classifier head and learns loop-length
    corrections from the raw bar estimate, the estimate shown to the user, and
    the final verified bar count.
@@ -32,19 +32,29 @@ Why this shape:
 
 ## Functions
 
-- `submitTrainingExample` — callable function for user-approved FTUE/correction metadata.
+- `submitTrainingExample` — callable function for user-approved FTUE and verified-beat metadata.
 - `indexTrainingUpload` — Storage finalize trigger that records uploaded files.
 - `getActiveModelManifest` — public HTTP endpoint for active dynamic
   model-release metadata.
 
 ## Automatic retraining
 
-Only correction uploads containing an exact labeled feature pack are eligible
-for classifier training. New app builds create that pack from the same aligned
-transients used for local personalization, so the cloud worker never has to
-guess which transient belongs to which grid cell. Corrections also include
-`rawPredictedBars`, `predictedBars`, and the final `bars`. Those labels are
+FTUE, confirmed-perfect, and corrected uploads containing an exact labeled
+feature pack are eligible for classifier training. New app builds create that pack from
+the same aligned transients used for local personalization, so the cloud worker
+never has to guess which transient belongs to which grid cell. Uploads also
+retain the original prediction and an explicit `verificationOutcome`, allowing
+the backend to reject an inconsistent perfect claim and measure what changed.
+Verified beats include `rawPredictedBars`, `predictedBars`, and the final
+`bars`. Those labels are
 eligible for rhythm training even when no transient feature pack can be made.
+
+The classifier trains on all three outcomes. Corrected beats receive 1.5x loss
+weight because they expose model mistakes, while confirmed-perfect beats use
+normal weight and provide representative successes. Within a corrected beat,
+relabels and deletions receive the strongest weight, timing moves receive a
+moderate boost, and user-added cells are down-weighted because their inferred
+crop center is less certain.
 
 The rhythm trainer learns conservative bar-count overrides only after at least
 three examples agree by a two-thirds majority. For example, repeated verified
@@ -54,18 +64,19 @@ the remote model manifest and applied before the grid is generated. A rhythm
 improvement can publish a new release even when the transient classifier does
 not change.
 
-The default threshold is five eligible corrected beats. `submitTrainingExample`
+The default threshold is five eligible verified beats. `submitTrainingExample`
 increments the counter transactionally and creates a `model_training_jobs`
 document whenever the threshold is reached. The `Retrain remote model` GitHub
 Actions workflow checks for queued jobs every 15 minutes. It:
 
-1. Claims one queued correction batch.
+1. Claims one queued verified-beat batch.
 2. Downloads every eligible feature pack through that batch.
-3. Holds back a deterministic subset of complete beats for validation.
+3. Holds back complete users for validation; one user's beats can never appear
+   in both training and validation.
 4. Fine-tunes only the final classifier layer with an anchor penalty to limit
    catastrophic drift.
-5. Rejects candidates that do not improve validation accuracy or loss, or that
-   regress too far on a represented class.
+5. Requires validation coverage for every sound and rejects candidates that
+   regress macro-F1 or any class's recall, or fail to improve accuracy/loss.
 6. Exports a checksum-verified ExecuTorch model, increments the active patch
    version, uploads its trainable checkpoint, and atomically promotes it.
 
@@ -88,6 +99,25 @@ Training jobs finish as `completed`, `completed_no_promotion`, or `failed` in
 Firestore. A completed job's `publishedModelVersion` identifies the promoted
 release. A no-promotion result is expected when five corrections do not yet
 provide enough class coverage or measurable held-out improvement.
+
+The default promotion minimum is three distinct users. Override it only for a
+controlled experiment with `SPITTY_MIN_DISTINCT_USERS`; lowering it weakens the
+claim that validation represents an unseen beatboxer. Timing, relabel, add,
+delete, BPM, quantization, and bar changes remain stored even when a candidate
+is not promoted, so later jobs can train on the accrued evidence.
+
+For temporal-transcriber experiments, export only consented, eligible examples
+with their raw WAV and correction-operation pack:
+
+```sh
+export GOOGLE_APPLICATION_CREDENTIALS=/absolute/path/to/service-account.json
+cd functions
+npm run training:export -- --output /absolute/path/to/spitty-training-corpus
+```
+
+The export contains anonymous Firebase UIDs solely to keep each person in one
+deterministic train/validation/test partition. Treat the directory as private
+user data; do not commit it or upload it to public CI artifacts.
 
 ## Publish a base model
 
@@ -134,7 +164,7 @@ On-device behavior:
 - A failed request, incompatible manifest, or bad checksum leaves the current
   downloaded model (or bundled model) active and will be retried later.
 - Valid downloaded releases are retained side by side, preserving rollback.
-- FTUE and correction prototypes remain local and are applied after whichever
+- FTUE and verified-beat prototypes remain local and are applied after whichever
   verified base model is active.
 
 ## Setup

@@ -33,6 +33,7 @@ def load_bar_examples(db: Any, through_sequence: int) -> list[dict[str, Any]]:
         examples.append(
             {
                 "id": snapshot.id,
+                "uid": document.get("uid", "unknown"),
                 "raw_predicted": raw_predicted,
                 "predicted": predicted,
                 "corrected": corrected,

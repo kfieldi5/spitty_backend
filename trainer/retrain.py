@@ -36,12 +36,27 @@ from rhythm import (
     normalize_rhythm_bar_model,
     train_rhythm_bar_model,
 )
+from validation import distinct_users, stable_user_partition
 
 
 FEATURE_SHAPE = (1, 64, 36)
 FEATURE_COUNT = math.prod(FEATURE_SHAPE)
 MAX_PACK_BYTES = 8 * 1024 * 1024
 MAX_UNCOMPRESSED_PACK_BYTES = 64 * 1024 * 1024
+VERIFICATION_WEIGHTS = {"perfect": 1.0, "corrected": 1.5, "ftue": 1.0}
+CORRECTION_OPERATION_WEIGHTS = {
+    "confirmed": 1.0,
+    "relabeled": 1.6,
+    "moved": 1.3,
+    "deleted": 1.6,
+    # An added cell is valuable evidence that onset detection missed a sound,
+    # but its synthesized clip center is less certain than a detected onset.
+    "added": 0.7,
+}
+MIN_DISTINCT_USERS = int(os.environ.get("SPITTY_MIN_DISTINCT_USERS", "3"))
+MIN_VALIDATION_EXAMPLES_PER_SOUND = int(
+    os.environ.get("SPITTY_MIN_VALIDATION_EXAMPLES_PER_SOUND", "1")
+)
 
 
 class NoQueuedJob(RuntimeError):
@@ -118,12 +133,14 @@ def load_sample_packs(
         document = snapshot.to_dict() or {}
         sequence = document.get("trainingSequence")
         path = document.get("samplesStoragePath")
+        verification_outcome = document.get("verificationOutcome", "corrected")
         if (
             document.get("trainingEligible") is not True
             or document.get("reviewStatus") == "rejected"
             or not isinstance(sequence, int)
             or sequence > through_sequence
             or not isinstance(path, str)
+            or verification_outcome not in VERIFICATION_WEIGHTS
         ):
             continue
         blob = bucket.blob(path)
@@ -135,14 +152,19 @@ def load_sample_packs(
             raise ValueError(f"Expanded training sample pack is too large: {path}")
         payload = json.loads(decoded)
         if (
-            payload.get("schema_version") != 1
+            payload.get("schema_version") not in (1, 2)
             or payload.get("preprocessing")
             != "log_mel_v1_16khz_5600_samples"
             or payload.get("shape") != [1, 1, 64, 36]
             or not isinstance(payload.get("samples"), list)
         ):
             raise ValueError(f"Training sample pack has an incompatible schema: {path}")
-        samples: list[tuple[list[float], int]] = []
+        pack_outcome = payload.get("verification_outcome")
+        if pack_outcome is not None and pack_outcome != verification_outcome:
+            raise ValueError(
+                f"Training sample pack verification outcome does not match: {path}"
+            )
+        samples: list[tuple[list[float], int, str]] = []
         for sample in payload["samples"]:
             label_name = sample.get("label")
             features = sample.get("features")
@@ -153,7 +175,12 @@ def load_sample_packs(
             values = [float(value) for value in features]
             if not all(math.isfinite(value) for value in values):
                 raise ValueError(f"Training sample contains non-finite features: {path}")
-            samples.append((values, LABELS.index(label_name)))
+            operation = sample.get("operation", "confirmed")
+            if operation not in CORRECTION_OPERATION_WEIGHTS:
+                raise ValueError(
+                    f"Training sample contains an invalid correction operation: {path}"
+                )
+            samples.append((values, LABELS.index(label_name), operation))
         if not samples:
             continue
         packs.append(
@@ -161,6 +188,7 @@ def load_sample_packs(
                 "id": snapshot.id,
                 "uid": document.get("uid", "unknown"),
                 "sequence": sequence,
+                "verification_outcome": verification_outcome,
                 "samples": samples,
             }
         )
@@ -169,29 +197,36 @@ def load_sample_packs(
 
 
 def stable_partition(packs: list[dict[str, Any]]) -> tuple[list[Any], list[Any]]:
-    if len(packs) < 2:
-        raise NoPromotion("At least two corrected beats are required for validation.")
-    validation = [
-        pack
+    try:
+        return stable_user_partition(
+            packs,
+            minimum_users=MIN_DISTINCT_USERS,
+        )
+    except ValueError as error:
+        raise NoPromotion(str(error)) from error
+
+
+def flatten_samples(
+    packs: list[dict[str, Any]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    examples = [
+        (
+            sample[0],
+            sample[1],
+            VERIFICATION_WEIGHTS[pack["verification_outcome"]]
+            * CORRECTION_OPERATION_WEIGHTS[sample[2]],
+        )
         for pack in packs
-        if int(hashlib.sha256(pack["id"].encode()).hexdigest()[:8], 16) % 5 == 0
+        for sample in pack["samples"]
     ]
-    if not validation:
-        validation = [packs[-1]]
-    if len(validation) == len(packs):
-        validation = [validation[-1]]
-    validation_ids = {pack["id"] for pack in validation}
-    training = [pack for pack in packs if pack["id"] not in validation_ids]
-    return training, validation
-
-
-def flatten_samples(packs: list[dict[str, Any]]) -> tuple[torch.Tensor, torch.Tensor]:
-    examples = [sample for pack in packs for sample in pack["samples"]]
     if not examples:
-        raise NoPromotion("No usable correction samples were found.")
+        raise NoPromotion("No usable verified samples were found.")
     features = torch.tensor([item[0] for item in examples], dtype=torch.float32)
     labels = torch.tensor([item[1] for item in examples], dtype=torch.long)
-    return features.reshape((-1, *FEATURE_SHAPE)), labels
+    verification_weights = torch.tensor(
+        [item[2] for item in examples], dtype=torch.float32
+    )
+    return features.reshape((-1, *FEATURE_SHAPE)), labels, verification_weights
 
 
 def load_checkpoint(path: Path) -> tuple[BeatboxClassifier, Config, dict[str, Any]]:
@@ -213,20 +248,42 @@ def evaluate(
     loss = F.cross_entropy(logits, labels).item()
     predictions = logits.argmax(1)
     accuracy = (predictions == labels).float().mean().item()
-    per_label: dict[str, float] = {}
+    per_label: dict[str, dict[str, float | int]] = {}
+    f1_scores: list[float] = []
     for index, name in enumerate(LABELS):
         mask = labels == index
-        if int(mask.sum()) > 0:
-            per_label[name] = (
-                (predictions[mask] == labels[mask]).float().mean().item()
+        support = int(mask.sum())
+        if support > 0:
+            true_positives = int(((predictions == index) & mask).sum())
+            false_positives = int(((predictions == index) & ~mask).sum())
+            false_negatives = support - true_positives
+            precision = true_positives / max(true_positives + false_positives, 1)
+            recall = true_positives / support
+            f1 = (
+                0.0
+                if precision + recall == 0
+                else 2 * precision * recall / (precision + recall)
             )
-    return {"loss": loss, "accuracy": accuracy, "per_label": per_label}
+            per_label[name] = {
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "support": support,
+            }
+            f1_scores.append(f1)
+    return {
+        "loss": loss,
+        "accuracy": accuracy,
+        "macro_f1": sum(f1_scores) / len(f1_scores) if f1_scores else 0.0,
+        "per_label": per_label,
+    }
 
 
 def train_candidate(
     baseline: FeatureClassifier,
     train_features: torch.Tensor,
     train_labels: torch.Tensor,
+    train_verification_weights: torch.Tensor,
     validation_features: torch.Tensor,
     validation_labels: torch.Tensor,
     seed: int,
@@ -253,7 +310,11 @@ def train_candidate(
         dtype=torch.float32,
     )
     optimizer = torch.optim.AdamW(final_layer.parameters(), lr=7e-4, weight_decay=1e-4)
-    dataset = TensorDataset(train_features, train_labels)
+    dataset = TensorDataset(
+        train_features,
+        train_labels,
+        train_verification_weights,
+    )
     generator = torch.Generator().manual_seed(seed)
     loader = DataLoader(
         dataset,
@@ -266,19 +327,33 @@ def train_candidate(
         validation_features,
         validation_labels,
     )
+    for label in LABELS[:4]:
+        support = int(baseline_metrics["per_label"].get(label, {}).get("support", 0))
+        if support < MIN_VALIDATION_EXAMPLES_PER_SOUND:
+            raise NoPromotion(
+                f"Validation needs at least {MIN_VALIDATION_EXAMPLES_PER_SOUND} "
+                f"{label} examples; found {support}."
+            )
     best_state = copy.deepcopy(candidate.state_dict())
     best_metrics = evaluate(candidate, validation_features, validation_labels)
     for _ in range(48):
         candidate.train()
-        for batch_features, batch_labels in loader:
+        for batch_features, batch_labels, batch_verification_weights in loader:
             optimizer.zero_grad(set_to_none=True)
             logits = candidate(batch_features)
-            classification = F.cross_entropy(
+            per_sample_loss = F.cross_entropy(
                 logits,
                 batch_labels,
                 weight=weights,
                 label_smoothing=0.02,
+                reduction="none",
             )
+            effective_weights = (
+                weights[batch_labels] * batch_verification_weights
+            )
+            classification = (
+                per_sample_loss * batch_verification_weights
+            ).sum() / effective_weights.sum().clamp_min(1e-6)
             anchor = (
                 (final_layer.weight - original_weight).pow(2).mean()
                 + (final_layer.bias - original_bias).pow(2).mean()
@@ -287,25 +362,34 @@ def train_candidate(
             optimizer.step()
         metrics = evaluate(candidate, validation_features, validation_labels)
         if (
-            metrics["accuracy"] > best_metrics["accuracy"]
+            metrics["macro_f1"] > best_metrics["macro_f1"]
             or (
-                metrics["accuracy"] == best_metrics["accuracy"]
-                and metrics["loss"] < best_metrics["loss"]
+                metrics["macro_f1"] == best_metrics["macro_f1"]
+                and (
+                    metrics["accuracy"] > best_metrics["accuracy"]
+                    or (
+                        metrics["accuracy"] == best_metrics["accuracy"]
+                        and metrics["loss"] < best_metrics["loss"]
+                    )
+                )
             )
         ):
             best_state = copy.deepcopy(candidate.state_dict())
             best_metrics = metrics
     candidate.load_state_dict(best_state)
-    if best_metrics["accuracy"] + 1e-6 < baseline_metrics["accuracy"]:
-        raise NoPromotion("Candidate validation accuracy regressed.")
+    if best_metrics["macro_f1"] + 1e-6 < baseline_metrics["macro_f1"]:
+        raise NoPromotion("Candidate validation macro-F1 regressed.")
     if (
         best_metrics["accuracy"] <= baseline_metrics["accuracy"] + 1e-6
         and best_metrics["loss"] >= baseline_metrics["loss"] * 0.995
     ):
         raise NoPromotion("Candidate did not improve validation accuracy or loss.")
-    for label, baseline_accuracy in baseline_metrics["per_label"].items():
-        candidate_accuracy = best_metrics["per_label"].get(label, 0.0)
-        if candidate_accuracy + 0.20 < baseline_accuracy:
+    for label, baseline_label_metrics in baseline_metrics["per_label"].items():
+        baseline_recall = float(baseline_label_metrics["recall"])
+        candidate_recall = float(
+            best_metrics["per_label"].get(label, {}).get("recall", 0.0)
+        )
+        if candidate_recall + 0.15 < baseline_recall:
             raise NoPromotion(f"Candidate regressed too far on {label}.")
     return candidate, baseline_metrics, best_metrics
 
@@ -354,6 +438,9 @@ def publish_candidate(
     candidate_bar_metrics: dict[str, Any],
     correction_count: int,
     included_example_count: int,
+    verification_counts: dict[str, int],
+    correction_operation_counts: dict[str, int],
+    distinct_users_in_release: set[str],
     workdir: Path,
 ) -> str:
     active_reference = db.collection("model_releases").document("active")
@@ -386,7 +473,12 @@ def publish_candidate(
         content_type="application/octet-stream",
     )
     metrics = {
-        "corrected_training_samples": correction_count,
+        "classifier_training_samples": correction_count,
+        "distinct_contributing_users": len(distinct_users_in_release),
+        "perfect_classifier_beats": verification_counts.get("perfect", 0),
+        "corrected_classifier_beats": verification_counts.get("corrected", 0),
+        "ftue_classifier_beats": verification_counts.get("ftue", 0),
+        "correction_operations": correction_operation_counts,
         "rhythm_bar_examples": candidate_bar_metrics["example_count"],
         "rhythm_bar_accuracy": candidate_bar_metrics["accuracy"],
         "rhythm_bar_override_count": candidate_bar_metrics["override_count"],
@@ -396,8 +488,11 @@ def publish_candidate(
             {
                 "baseline_validation_accuracy": baseline_metrics["accuracy"],
                 "candidate_validation_accuracy": candidate_metrics["accuracy"],
+                "baseline_validation_macro_f1": baseline_metrics["macro_f1"],
+                "candidate_validation_macro_f1": candidate_metrics["macro_f1"],
                 "baseline_validation_loss": baseline_metrics["loss"],
                 "candidate_validation_loss": candidate_metrics["loss"],
+                "candidate_validation_per_label": candidate_metrics["per_label"],
             }
         )
     runtime_release = {
@@ -415,7 +510,7 @@ def publish_candidate(
         "storage_path": storage_model_path,
         "training_checkpoint_path": storage_checkpoint_path,
         "published_at": utc_now().isoformat(),
-        "dataset": "AVP_Dataset + consented corrected Spitty beats",
+        "dataset": "AVP_Dataset + consented verified Spitty beats",
         "metrics": metrics,
         "rhythm_bar_model": rhythm_bar_model,
         "limitations": [
@@ -487,18 +582,33 @@ def main() -> int:
         baseline_bar_model = normalize_rhythm_bar_model(
             active.get("rhythm_bar_model")
         )
-        candidate_bar_model = train_rhythm_bar_model(bar_examples)
-        baseline_bar_metrics = evaluate_rhythm_bar_model(
-            baseline_bar_model, bar_examples
-        )
-        candidate_bar_metrics = evaluate_rhythm_bar_model(
-            candidate_bar_model, bar_examples
-        )
-        bar_model_improved = (
-            candidate_bar_model["overrides"] != baseline_bar_model["overrides"]
-            and candidate_bar_metrics["accuracy"]
-            > baseline_bar_metrics["accuracy"] + 1e-9
-        )
+        baseline_bar_metrics = evaluate_rhythm_bar_model(baseline_bar_model, [])
+        candidate_bar_model = baseline_bar_model
+        candidate_bar_metrics = baseline_bar_metrics
+        bar_model_improved = False
+        try:
+            bar_training, bar_validation = stable_user_partition(
+                bar_examples,
+                minimum_users=MIN_DISTINCT_USERS,
+            )
+            candidate_bar_model = train_rhythm_bar_model(bar_training)
+            baseline_bar_metrics = evaluate_rhythm_bar_model(
+                baseline_bar_model, bar_validation
+            )
+            candidate_bar_metrics = evaluate_rhythm_bar_model(
+                candidate_bar_model, bar_validation
+            )
+            bar_model_improved = (
+                candidate_bar_model["overrides"]
+                != baseline_bar_model["overrides"]
+                and candidate_bar_metrics["accuracy"]
+                > baseline_bar_metrics["accuracy"] + 1e-9
+            )
+        except ValueError:
+            # Rhythm overrides need the same user-disjoint evidence as the
+            # classifier. A small single-user batch remains collected but is
+            # not permitted to change the universal model.
+            pass
         selected_bar_model = (
             candidate_bar_model if bar_model_improved else baseline_bar_model
         )
@@ -520,17 +630,22 @@ def main() -> int:
             candidate_metrics = None
             correction_count = 0
             sound_model_improved = False
-            sound_no_promotion_reason = "Not enough classifier correction packs."
+            sound_no_promotion_reason = "Not enough verified classifier packs."
             try:
                 training_packs, validation_packs = stable_partition(packs)
-                training_features, training_labels = flatten_samples(training_packs)
-                validation_features, validation_labels = flatten_samples(
+                (
+                    training_features,
+                    training_labels,
+                    training_verification_weights,
+                ) = flatten_samples(training_packs)
+                validation_features, validation_labels, _ = flatten_samples(
                     validation_packs
                 )
                 candidate, baseline_metrics, candidate_metrics = train_candidate(
                     baseline,
                     training_features,
                     training_labels,
+                    training_verification_weights,
                     validation_features,
                     validation_labels,
                     seed=config.seed + through_sequence,
@@ -560,6 +675,17 @@ def main() -> int:
                 selected_bar_metrics,
                 correction_count=correction_count,
                 included_example_count=max(len(packs), len(bar_examples)),
+                verification_counts=dict(
+                    Counter(pack["verification_outcome"] for pack in packs)
+                ),
+                correction_operation_counts=dict(
+                    Counter(
+                        operation
+                        for pack in packs
+                        for _, _, operation in pack["samples"]
+                    )
+                ),
+                distinct_users_in_release=distinct_users([*packs, *bar_examples]),
                 workdir=workdir,
             )
         print(f"Published validation-gated Spitty model {version}.")

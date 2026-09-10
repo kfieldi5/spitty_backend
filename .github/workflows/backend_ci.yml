@@ -27,7 +27,9 @@ jobs:
 
       - name: Build
         working-directory: functions
-        run: npm run build
+        run: |
+          npm run build
+          npm run lint
 
       - name: Check model publisher
         working-directory: functions
@@ -35,9 +37,10 @@ jobs:
           npm run model:check
           node --check scripts/set-training-threshold.mjs
           node --check scripts/has-queued-training.mjs
+          node --check scripts/export-training-corpus.mjs
 
       - name: Check remote trainer
         run: |
-          python3 -m py_compile trainer/model.py trainer/rhythm.py trainer/retrain.py
+          python3 -m py_compile trainer/model.py trainer/rhythm.py trainer/retrain.py trainer/validation.py
           python3 -m unittest discover -s trainer -p 'test_*.py'
           test -s trainer/seed/beatbox_classifier.pth

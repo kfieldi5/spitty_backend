@@ -9,10 +9,20 @@ initializeApp();
 const db = getFirestore();
 
 type DrumSound = "kick" | "snare" | "closedHat" | "openHat" | "rest";
+type Quantization = "1/2" | "1/4" | "1/8" | "1/16";
+type VerificationOutcome = "perfect" | "corrected" | "ftue";
 
 type GridEvent = {
   sound: DrumSound;
   step: number;
+  confidence?: number;
+};
+
+type PatternSnapshot = {
+  bpm: number;
+  bars: number;
+  quantization: Quantization;
+  events: GridEvent[];
 };
 
 type TrainingExamplePayload = {
@@ -22,8 +32,10 @@ type TrainingExamplePayload = {
   bars: number;
   predictedBars?: number;
   rawPredictedBars?: number;
-  quantization: "1/2" | "1/4" | "1/8" | "1/16";
+  quantization: Quantization;
   events: GridEvent[];
+  verificationOutcome?: VerificationOutcome;
+  originalPattern?: PatternSnapshot;
   appVersion?: string;
   localModelVersion?: string;
   notes?: string;
@@ -40,6 +52,183 @@ const sounds = new Set<DrumSound>([
   "openHat",
   "rest",
 ]);
+const quantizations = new Set<Quantization>(["1/2", "1/4", "1/8", "1/16"]);
+const verificationOutcomes = new Set<VerificationOutcome>([
+  "perfect",
+  "corrected",
+  "ftue",
+]);
+
+function validatedEvents(value: unknown, field: string): GridEvent[] {
+  if (!Array.isArray(value)) {
+    throw new HttpsError("invalid-argument", `${field} must be an array.`);
+  }
+  for (const rawEvent of value) {
+    if (!rawEvent || typeof rawEvent !== "object") {
+      throw new HttpsError("invalid-argument", `${field} contains an invalid event.`);
+    }
+    const event = rawEvent as Partial<GridEvent>;
+    if (!sounds.has(event.sound as DrumSound)) {
+      throw new HttpsError("invalid-argument", `Invalid sound: ${event.sound}`);
+    }
+    if (!Number.isInteger(event.step) || (event.step ?? -1) < 0) {
+      throw new HttpsError(
+        "invalid-argument",
+        `${field} event steps must be non-negative integers.`
+      );
+    }
+    if (
+      event.confidence !== undefined &&
+      (typeof event.confidence !== "number" ||
+        !Number.isFinite(event.confidence) ||
+        event.confidence < 0 ||
+        event.confidence > 1)
+    ) {
+      throw new HttpsError(
+        "invalid-argument",
+        `${field} event confidence must be between zero and one.`
+      );
+    }
+  }
+  return value as GridEvent[];
+}
+
+function validatedPatternSnapshot(value: unknown): PatternSnapshot {
+  if (!value || typeof value !== "object") {
+    throw new HttpsError("invalid-argument", "originalPattern must be an object.");
+  }
+  const pattern = value as Partial<PatternSnapshot>;
+  if (
+    !Number.isInteger(pattern.bpm) ||
+    (pattern.bpm ?? 0) < 40 ||
+    (pattern.bpm ?? 0) > 220
+  ) {
+    throw new HttpsError(
+      "invalid-argument",
+      "originalPattern.bpm must be between 40 and 220."
+    );
+  }
+  if (
+    !Number.isInteger(pattern.bars) ||
+    (pattern.bars ?? 0) < 1 ||
+    (pattern.bars ?? 0) > 32
+  ) {
+    throw new HttpsError(
+      "invalid-argument",
+      "originalPattern.bars must be between 1 and 32."
+    );
+  }
+  if (!quantizations.has(pattern.quantization as Quantization)) {
+    throw new HttpsError(
+      "invalid-argument",
+      "originalPattern.quantization is invalid."
+    );
+  }
+  return {
+    bpm: pattern.bpm as number,
+    bars: pattern.bars as number,
+    quantization: pattern.quantization as Quantization,
+    events: validatedEvents(pattern.events, "originalPattern.events"),
+  };
+}
+
+function summarizePatternEdit(original: PatternSnapshot, final: PatternSnapshot) {
+  const remainingOriginal = original.events.map((event) => ({...event}));
+  const remainingFinal = final.events.map((event) => ({...event}));
+  const operations: Record<string, unknown>[] = [];
+
+  // Remove exact matches first. They are useful confirmed positives but not
+  // correction operations.
+  for (let index = remainingOriginal.length - 1; index >= 0; index--) {
+    const event = remainingOriginal[index];
+    const match = remainingFinal.findIndex(
+      (candidate) => candidate.step === event.step && candidate.sound === event.sound
+    );
+    if (match >= 0) {
+      remainingOriginal.splice(index, 1);
+      remainingFinal.splice(match, 1);
+    }
+  }
+
+  // A different sound in the same cell is a class-label correction.
+  for (let index = remainingOriginal.length - 1; index >= 0; index--) {
+    const event = remainingOriginal[index];
+    const match = remainingFinal.findIndex((candidate) => candidate.step === event.step);
+    if (match >= 0) {
+      const replacement = remainingFinal[match];
+      operations.push({
+        type: "relabel",
+        step: event.step,
+        fromSound: event.sound,
+        toSound: replacement.sound,
+      });
+      remainingOriginal.splice(index, 1);
+      remainingFinal.splice(match, 1);
+    }
+  }
+
+  // Match the nearest remaining occurrence of the same sound as a timing move.
+  while (true) {
+    let best: {original: number; final: number; distance: number} | undefined;
+    for (let originalIndex = 0; originalIndex < remainingOriginal.length; originalIndex++) {
+      for (let finalIndex = 0; finalIndex < remainingFinal.length; finalIndex++) {
+        if (remainingOriginal[originalIndex].sound !== remainingFinal[finalIndex].sound) {
+          continue;
+        }
+        const distance = Math.abs(
+          remainingOriginal[originalIndex].step - remainingFinal[finalIndex].step
+        );
+        if (!best || distance < best.distance) {
+          best = {original: originalIndex, final: finalIndex, distance};
+        }
+      }
+    }
+    if (!best) break;
+    const event = remainingOriginal[best.original];
+    const replacement = remainingFinal[best.final];
+    operations.push({
+      type: "move",
+      sound: event.sound,
+      fromStep: event.step,
+      toStep: replacement.step,
+    });
+    remainingOriginal.splice(best.original, 1);
+    remainingFinal.splice(best.final, 1);
+  }
+
+  for (const event of remainingOriginal) {
+    operations.push({type: "delete", step: event.step, sound: event.sound});
+  }
+  for (const event of remainingFinal) {
+    operations.push({type: "add", step: event.step, sound: event.sound});
+  }
+
+  const addedEvents = remainingFinal.length;
+  const removedEvents = remainingOriginal.length;
+  const relabeledEvents = operations.filter((operation) => operation.type === "relabel").length;
+  const movedEvents = operations.filter((operation) => operation.type === "move").length;
+  const bpmChanged = original.bpm !== final.bpm;
+  const barsChanged = original.bars !== final.bars;
+  const quantizationChanged = original.quantization !== final.quantization;
+  return {
+    exactMatch:
+      addedEvents === 0 &&
+      removedEvents === 0 &&
+      relabeledEvents === 0 &&
+      movedEvents === 0 &&
+      !bpmChanged &&
+      !barsChanged &&
+      !quantizationChanged,
+    addedEvents,
+    removedEvents,
+    relabeledEvents,
+    movedEvents,
+    bpmChanged,
+    barsChanged,
+    quantizationChanged,
+    operations,
+  };
+}
 
 function assertTrainingPayload(data: unknown): TrainingExamplePayload {
   if (!data || typeof data !== "object") {
@@ -58,10 +247,18 @@ function assertTrainingPayload(data: unknown): TrainingExamplePayload {
       "storagePath must point to training_uploads/."
     );
   }
-  if (typeof payload.bpm !== "number" || payload.bpm < 40 || payload.bpm > 220) {
+  if (
+    !Number.isInteger(payload.bpm) ||
+    (payload.bpm ?? 0) < 40 ||
+    (payload.bpm ?? 0) > 220
+  ) {
     throw new HttpsError("invalid-argument", "bpm must be between 40 and 220.");
   }
-  if (typeof payload.bars !== "number" || payload.bars < 1 || payload.bars > 32) {
+  if (
+    !Number.isInteger(payload.bars) ||
+    (payload.bars ?? 0) < 1 ||
+    (payload.bars ?? 0) > 32
+  ) {
     throw new HttpsError("invalid-argument", "bars must be between 1 and 32.");
   }
   for (const [name, value] of [
@@ -87,18 +284,51 @@ function assertTrainingPayload(data: unknown): TrainingExamplePayload {
       "rawPredictedBars requires predictedBars."
     );
   }
-  if (!["1/2", "1/4", "1/8", "1/16"].includes(payload.quantization ?? "")) {
+  if (!quantizations.has(payload.quantization as Quantization)) {
     throw new HttpsError("invalid-argument", "Invalid quantization.");
   }
-  if (!Array.isArray(payload.events)) {
-    throw new HttpsError("invalid-argument", "events must be an array.");
+  payload.events = validatedEvents(payload.events, "events");
+  if (
+    payload.verificationOutcome !== undefined &&
+    !verificationOutcomes.has(payload.verificationOutcome)
+  ) {
+    throw new HttpsError("invalid-argument", "Invalid verificationOutcome.");
   }
-  for (const event of payload.events) {
-    if (!sounds.has(event.sound)) {
-      throw new HttpsError("invalid-argument", `Invalid sound: ${event.sound}`);
+  if (payload.kind === "ftue") {
+    if (
+      (payload.verificationOutcome !== undefined &&
+        payload.verificationOutcome !== "ftue") ||
+      payload.originalPattern !== undefined
+    ) {
+      throw new HttpsError(
+        "invalid-argument",
+        "FTUE examples may only use the ftue verification outcome."
+      );
     }
-    if (!Number.isInteger(event.step) || event.step < 0) {
-      throw new HttpsError("invalid-argument", "Event steps must be positive integers.");
+    payload.verificationOutcome = "ftue";
+  } else {
+    payload.verificationOutcome ??= "corrected";
+    if (payload.originalPattern !== undefined) {
+      payload.originalPattern = validatedPatternSnapshot(
+        payload.originalPattern
+      );
+    }
+    if (
+      payload.verificationOutcome === "ftue"
+    ) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Correction examples cannot use the ftue verification outcome."
+      );
+    }
+    if (
+      payload.verificationOutcome === "perfect" &&
+      payload.originalPattern === undefined
+    ) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Perfect confirmations require originalPattern."
+      );
     }
   }
   if (payload.samplesStoragePath !== undefined) {
@@ -109,7 +339,7 @@ function assertTrainingPayload(data: unknown): TrainingExamplePayload {
     ) {
       throw new HttpsError(
         "invalid-argument",
-        "samplesStoragePath must point to a compressed correction sample pack."
+        "samplesStoragePath must point to a compressed training sample pack."
       );
     }
     if (
@@ -136,6 +366,21 @@ export const submitTrainingExample = onCall(async (request) => {
     throw new HttpsError("unauthenticated", "Sign in before uploading examples.");
   }
   const payload = assertTrainingPayload(request.data);
+  const finalPattern: PatternSnapshot = {
+    bpm: payload.bpm,
+    bars: payload.bars,
+    quantization: payload.quantization,
+    events: payload.events,
+  };
+  const editSummary = payload.originalPattern
+    ? summarizePatternEdit(payload.originalPattern, finalPattern)
+    : undefined;
+  if (payload.verificationOutcome === "perfect" && !editSummary?.exactMatch) {
+    throw new HttpsError(
+      "invalid-argument",
+      "A perfect confirmation must exactly match the original prediction."
+    );
+  }
   const userPrefix = `training_uploads/${request.auth.uid}/`;
   if (!payload.storagePath.startsWith(userPrefix)) {
     throw new HttpsError(
@@ -166,7 +411,7 @@ export const submitTrainingExample = onCall(async (request) => {
         ? configuredThreshold
         : defaultCorrectionsPerTrainingRun;
     const classifierTrainingEligible =
-      payload.kind === "correction" && Boolean(payload.samplesStoragePath);
+      Boolean(payload.samplesStoragePath);
     const barLengthTrainingEligible =
       payload.kind === "correction" &&
       Number.isInteger(payload.predictedBars) &&
@@ -180,9 +425,10 @@ export const submitTrainingExample = onCall(async (request) => {
 
     transaction.set(example, {
       ...payload,
+      ...(editSummary && {editSummary}),
       uid: request.auth!.uid,
       createdAt: FieldValue.serverTimestamp(),
-      schemaVersion: 3,
+      schemaVersion: 4,
       reviewStatus: "pending",
       trainingEligible: eligible,
       classifierTrainingEligible,
